@@ -1,0 +1,254 @@
+name: Export Vault to Repo, Compare Hashes
+
+on:
+  workflow_dispatch: # Allows manual triggering from the Actions tab
+  schedule:
+    - cron: '53 21 * * 0,1,2,3,4,5,6' # 5:53 am at hongkong
+
+jobs:
+  backup_vaultwarden_to_repo_compare_hash:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Required to commit and push changes to the repository
+    env:
+      BW_CLIENTID: ${{ secrets.SOURCE_CLIENT_ID }}
+      BW_CLIENTSECRET: ${{ secrets.SOURCE_CLIENT_SECRET }}
+      BW_PASSWORD: ${{ secrets.SOURCE_PASSWORD }}
+      SOURCE_SERVER_URL: ${{ secrets.SOURCE_SERVER_URL }}
+      JSON_ENCRYPTION_PASSWORD: ${{ secrets.JSON_ENCRYPTION_PASSWORD }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Bitwarden CLI and Dependencies
+        run: |
+          echo "Updating package list and installing dependencies..."
+          sudo apt-get update -y
+          sudo apt-get install -y unzip curl jq # jq is useful, curl & unzip for bw install
+
+          echo "Downloading Bitwarden CLI..."
+          curl -Lso bw.zip "https://vault.bitwarden.com/download/?app=cli&platform=linux"
+          unzip -o bw.zip # -o to overwrite if exists without prompting
+          echo "Installing Bitwarden CLI to /usr/local/bin/..."
+          sudo install bw /usr/local/bin/
+          rm bw.zip bw # Clean up downloaded files
+          echo "Bitwarden CLI version:"
+          bw --version
+        shell: bash
+
+      - name: Configure SOURCE Server URL
+        run: |
+          echo "Configuring Source URL: $SOURCE_SERVER_URL"
+          bw config server "$SOURCE_SERVER_URL"
+          echo "Current warden server configured:"
+          bw config server 
+          echo ""
+        shell: bash
+
+      - name: Login source warden via API Key and Capture Session Key
+        id: login_step 
+        run: |
+          echo "Logging into Source with API Key..."
+          # BW_CLIENTID and BW_CLIENTSECRET are available from job env
+          if ! bw login --apikey; then
+            echo "::error::Warden login via API key failed. Check client credentials and server reachability."
+            exit 1
+          fi
+
+          echo "Unlocking Source vault..."
+          # BW_PASSWORD is available from job env; NO space after `=`.
+          TEMP_SESSION_TOKEN=$(bw unlock "$BW_PASSWORD" --raw)
+
+          if [ -z "$TEMP_SESSION_TOKEN" ]; then
+            echo "::error::Failed to unlock vault. 'bw unlock --raw' did not return a session token."
+            echo "Ensure BW_PASSWORD is correct and the account is not locked."
+            exit 1
+          fi
+          
+          # Make the session token available to subsequent steps via GITHUB_ENV
+          # This token will be read into BW_SESSION env var in subsequent steps
+          echo "BW_SESSION_ENV_VAR=${TEMP_SESSION_TOKEN}" >> $GITHUB_ENV
+          echo "Source vault unlocked. Session token set in GITHUB_ENV for subsequent steps."
+        shell: bash
+
+      - name: Sync source to ensure data is up-to-date
+        env:
+          # BW_SESSION is the env var 'bw' CLI looks for. Populate it from GITHUB_ENV.
+          BW_SESSION: ${{ env.BW_SESSION_ENV_VAR }}
+        run: |
+          if [ -z "$BW_SESSION" ]; then
+            echo "::error::BW_SESSION is not set for sync. Login might have failed or token not passed correctly."
+            exit 1 
+          fi
+          echo "Syncing Source to ensure data is up-to-date..."
+          bw sync --force # bw sync should pick up BW_SESSION from its environment
+          echo "Sync complete."
+        shell: bash
+
+      - name: Create backup directory if not exists
+        run: mkdir -p vault_backup
+        shell: bash
+
+      - name: Calculate Current Vault Content Hash
+        id: calculate_hash
+        env:
+          BW_SESSION: ${{ env.BW_SESSION_ENV_VAR }}
+        run: |
+          echo "Calculating current vault content hash..."
+          if [ -z "$BW_SESSION" ]; then
+            echo "::error::BW_SESSION is not set for calculating hash. Login might have failed."
+            exit 1
+          fi
+          if ! bw list items --raw > current_items_raw.json; then
+            echo "::error::Failed to list items from source vault. Is the vault unlocked and session valid?"
+            exit 1
+          fi
+          if [ ! -s current_items_raw.json ]; then
+            echo "::warning::'bw list items --raw' produced an empty file. Assuming empty vault."
+            # Create a representation for an empty vault for consistent hashing
+            echo "[]" > current_items_sorted.json
+          elif ! jq --sort-keys . current_items_raw.json > current_items_sorted.json; then
+            echo "::error::jq failed to process items JSON. Content of current_items_raw.json:"
+            cat current_items_raw.json
+            exit 1
+          fi
+          CURRENT_HASH=$(sha256sum current_items_sorted.json | awk '{ print $1 }')
+          echo "Current vault content hash: $CURRENT_HASH"
+          echo "current_hash=$CURRENT_HASH" >> $GITHUB_OUTPUT
+          rm current_items_raw.json current_items_sorted.json
+        shell: bash
+
+      - name: Compare Hashes and Decide to Proceed
+        id: check_hash
+        run: |
+          CURRENT_HASH="${{ steps.calculate_hash.outputs.current_hash }}"
+          PREVIOUS_HASH_FILE="vault_backup/latest_content_hash.txt"
+          PROCEED_WITH_BACKUP="false"
+
+          if [ -z "$CURRENT_HASH" ]; then
+            echo "::error::Current hash was not calculated. Cannot proceed."
+            exit 1
+          fi
+
+          if [ ! -f "$PREVIOUS_HASH_FILE" ]; then
+            echo "No previous hash file ($PREVIOUS_HASH_FILE) found. Proceeding with backup."
+            PROCEED_WITH_BACKUP="true"
+          else
+            PREVIOUS_HASH=$(cat "$PREVIOUS_HASH_FILE")
+            if [ "$PREVIOUS_HASH" != "$CURRENT_HASH" ]; then
+              echo "Vault content has changed (Previous Hash: $PREVIOUS_HASH, Current Hash: $CURRENT_HASH). Proceeding with backup."
+              PROCEED_WITH_BACKUP="true"
+            else
+              echo "Vault content has NOT changed (Hash: $CURRENT_HASH). Skipping backup."
+              PROCEED_WITH_BACKUP="false"
+            fi
+          fi
+          echo "proceed=$PROCEED_WITH_BACKUP" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Generate timestamped filename
+        if: steps.check_hash.outputs.proceed == 'true'
+        id: set_filename
+        run: echo "filename=vault_backup/backup_$(date +'%Y%m%d_%H%M%S').json" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Export Data to Encrypted JSON
+        if: steps.check_hash.outputs.proceed == 'true'
+        env:
+          BW_SESSION: ${{ env.BW_SESSION_ENV_VAR }}
+          THE_FILENAME_FOR_EXPORT: ${{ steps.set_filename.outputs.filename }}
+        run: |
+          echo "Attempting to export vault to $THE_FILENAME_FOR_EXPORT..."
+          
+          if [ -z "$BW_SESSION" ]; then
+            echo "::error::BW_SESSION is not set for export. Login might have failed or token not passed correctly."
+            exit 1
+          fi
+          if [ -z "$JSON_ENCRYPTION_PASSWORD" ]; then 
+            echo "::error::JSON_ENCRYPTION_PASSWORD is not set. Cannot perform encrypted export."
+            exit 1
+          fi
+          if [ -z "$THE_FILENAME_FOR_EXPORT" ]; then
+            echo "::error::Filename for export (THE_FILENAME_FOR_EXPORT) is not set."
+            exit 1
+          fi
+
+          echo "Exporting vault using session token (first 5 chars): ${BW_SESSION:0:5}..."
+          bw export \
+            --output "$THE_FILENAME_FOR_EXPORT" \
+            --format encrypted_json \
+            --password "$JSON_ENCRYPTION_PASSWORD" \
+            --session "$BW_SESSION" \
+            --raw
+
+          if [ $? -ne 0 ]; then
+            echo "::error::Warden export command failed. Check CLI output above for details."
+            exit 1
+          fi
+
+          if [ ! -f "$THE_FILENAME_FOR_EXPORT" ]; then
+            echo "::error::Exported file '$THE_FILENAME_FOR_EXPORT' was NOT found after 'bw export' command executed."
+            echo "Listing contents of $(dirname "$THE_FILENAME_FOR_EXPORT") directory:"
+            ls -la "$(dirname "$THE_FILENAME_FOR_EXPORT")"
+            exit 1
+          else
+            echo "Vault export complete. File '$THE_FILENAME_FOR_EXPORT' created successfully."
+            ls -l "$THE_FILENAME_FOR_EXPORT" 
+          fi
+        shell: bash
+
+      - name: Update Hash File in Workspace
+        if: steps.check_hash.outputs.proceed == 'true'
+        run: |
+          echo "${{ steps.calculate_hash.outputs.current_hash }}" > vault_backup/latest_content_hash.txt
+          echo "Updated vault_backup/latest_content_hash.txt"
+        shell: bash
+
+      - name: Warden Logout
+        if: always() 
+        env:
+          BW_SESSION: ${{ env.BW_SESSION_ENV_VAR }}
+        run: |
+          if [ -n "$BW_SESSION" ]; then 
+            echo "Logging out from warden..."
+            bw logout 
+            echo "Logout complete."
+          else
+            echo "No active warden session detected to logout from (BW_SESSION_ENV_VAR was not set, empty, or login failed)."
+          fi
+        shell: bash
+
+      - name: Commit and push backup file
+        if: steps.check_hash.outputs.proceed == 'true'
+        env:
+          BACKUP_FILE: ${{ steps.set_filename.outputs.filename }}
+        run: |
+          git config --global user.name 'GitHub Actions Backup Bot'
+          git config --global user.email 'backup-bot@users.noreply.github.com'
+
+          HASH_FILE="vault_backup/latest_content_hash.txt"
+
+          if [ ! -f "$BACKUP_FILE" ]; then
+            echo "::error::Backup file '$BACKUP_FILE' not found. Cannot commit. Export might have failed."
+            exit 1
+          fi
+          if [ ! -f "$HASH_FILE" ]; then
+            echo "::error::Hash file '$HASH_FILE' not found. Cannot commit. Hash update step might have failed."
+            exit 1
+          fi
+
+          echo "Adding '$BACKUP_FILE' and '$HASH_FILE' to git..."
+          git add "$BACKUP_FILE" "$HASH_FILE"
+          
+          if git diff --staged --quiet; then
+            echo "No changes to commit. This is unexpected if a new backup was intended."
+          else
+            git commit -m "Add warden backup $(date +'%Y-%m-%d %H:%M:%S') and update content hash"
+            echo "Pushing backup and hash file to repository..."
+            # Pull latest changes before pushing to avoid conflicts
+            git pull --rebase
+            git push
+            echo "Backup and hash file pushed successfully."
+          fi
+        shell: bash

@@ -1,0 +1,234 @@
+name: Purge Vault and Import from Repo, On New Push
+
+on:
+  workflow_dispatch: # Allows manual triggering
+  # schedule: # Comment out or remove the schedule if you only want it triggered by the export
+  #   - cron: '53 22 * * 0,1,2,3,4,5,6' # 6:53 am at hongkong
+  #### Trigger by another workflow: following 4 lines.
+  workflow_run:
+    workflows: ["Export Vault to Repo, Compare Hashes"] # Name of the workflow that triggers this one
+    types:
+      - completed # Trigger when the specified workflow completes
+
+jobs:
+  import_to_destination_warden:
+    # Run this job if:
+    # 1. Manually dispatched.
+    # OR
+    # 2. Triggered by "Export Vault to Repo, Compare Hashes" which completed successfully
+    #    AND the repository's state (commit SHA) has changed since the triggering workflow started,
+    #    implying new data was pushed by the export workflow.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.sha != github.event.workflow_run.head_sha
+      )
+
+    runs-on: ubuntu-latest
+    env:
+      # Secrets for the Destination Warden Account using Bitwarden CLI default env var names
+      BW_CLIENTID: ${{ secrets.DEST_CLIENT_ID }}
+      BW_CLIENTSECRET: ${{ secrets.DEST_CLIENT_SECRET }}
+      BW_PASSWORD: ${{ secrets.DEST_PASSWORD }} # For unlocking the vault
+      DEST_SERVER_URL: ${{ secrets.DEST_SERVER_URL }}
+      # Password used to encrypt the JSON backup files
+      JSON_ENCRYPTION_PASSWORD: ${{ secrets.JSON_ENCRYPTION_PASSWORD }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        # fetch-depth: 0 # Uncomment if you need full git history for other purposes
+
+      - name: Install Bitwarden CLI and Dependencies
+        run: |
+          echo "Updating package list and installing dependencies..."
+          sudo apt-get update -y
+          sudo apt-get install -y unzip curl jq # jq is useful, curl & unzip for bw install
+
+          echo "Downloading Bitwarden CLI..."
+          curl -Lso bw.zip "https://vault.bitwarden.com/download/?app=cli&platform=linux"
+          unzip -o bw.zip # -o to overwrite if exists without prompting
+          echo "Installing Bitwarden CLI to /usr/local/bin/..."
+          sudo install bw /usr/local/bin/
+          rm bw.zip bw # Clean up downloaded files
+          echo "Bitwarden CLI version:"
+          bw --version
+        shell: bash
+
+      - name: Find the latest backup file
+        id: find_backup
+        run: |
+          echo "Looking for backup files in vault_backup/ ..."
+          BACKUP_DIR="vault_backup" # Assuming backups are in this directory
+          if [ ! -d "$BACKUP_DIR" ]; then
+            echo "::error::Backup directory '$BACKUP_DIR' does not exist in the repository."
+            exit 1
+          fi
+          # List .json files in the backup directory, sort by time (most recent first), and take the top one.
+          LATEST_BACKUP_FILE=$(ls -1t "$BACKUP_DIR"/backup_*.json 2>/dev/null | head -n 1)
+
+          if [ -z "$LATEST_BACKUP_FILE" ]; then
+            echo "::error::No backup files found in '$BACKUP_DIR' matching the pattern 'backup_*.json'. Exiting."
+            exit 1
+          fi
+          echo "Latest backup file found: $LATEST_BACKUP_FILE"
+          echo "latest_file_path=$LATEST_BACKUP_FILE" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Configure Destination Warden Server URL
+        run: |
+          echo "Configuring Destination URL: $DEST_SERVER_URL"
+          if [ -z "$DEST_SERVER_URL" ]; then
+            echo "::error::DEST_SERVER_URL secret is not set."
+            exit 1
+          fi
+          bw config server "$DEST_SERVER_URL"
+          echo "Current warden server configured (destination):"
+          bw config server || echo "Warning: Failed to display current server config, but proceeding."
+          echo ""
+        shell: bash
+
+      - name: Login to Destination Warden via API Key and Capture Session Key
+        id: login_dest_warden
+        run: |
+          echo "Logging into Destination with API Key..."
+          # BW_CLIENTID and BW_CLIENTSECRET are available from job env
+          if ! bw login --apikey; then
+            echo "::error::Warden login via API key failed. Check client credentials and server reachability."
+            exit 1
+          fi
+
+          echo "Unlocking Destination vault..."
+          # BW_PASSWORD is available from job env
+          TEMP_SESSION_TOKEN=$(bw unlock "$BW_PASSWORD" --raw)
+
+          if [ -z "$TEMP_SESSION_TOKEN" ]; then
+            echo "::error::Failed to unlock vault. 'bw unlock --raw' did not return a session token."
+            echo "Ensure BW_PASSWORD is correct and the account is not locked."
+            exit 1
+          fi
+
+          # Make the session token available to subsequent steps via GITHUB_ENV
+          echo "BW_SESSION_ENV_VAR=${TEMP_SESSION_TOKEN}" >> $GITHUB_ENV
+          echo "Destination vault unlocked. Session token set in GITHUB_ENV for subsequent steps."
+        shell: bash
+
+      - name: Sync Destination Warden (Pre-Purge)
+        env:
+          BW_SESSION: ${{ env.BW_SESSION_ENV_VAR }}
+        run: |
+          if [ -z "$BW_SESSION" ]; then
+            echo "::error::BW_SESSION_ENV_VAR is not set for sync. Login might have failed or token not passed correctly."
+            exit 1
+          fi
+          echo "Syncing Destination Warden to ensure data is up-to-date before purging..."
+          bw sync --force
+          echo "Sync complete."
+        shell: bash
+
+      - name: Purge Destination Vault (Default Owner Items and All Folders, No Organizations)
+        env:
+          BW_SESSION: ${{ env.BW_SESSION_ENV_VAR }}
+        run: |
+          echo "--- Starting Vault Purge (Default Owner Items and All Folders) ---"
+          if [ -z "$BW_SESSION" ]; then
+            echo "::error::BW_SESSION is not set for purge step."
+            exit 1
+          fi
+
+          echo "Fetching personal vault item IDs (organizationId is null)..."
+          # Filter for items where organizationId is null (personal items)
+          ITEM_IDS=$(bw list items --raw | jq -r '.[] | select(.organizationId == null) | .id')
+
+          if [ -n "$ITEM_IDS" ]; then
+            echo "Found personal items to delete. Deleting personal items..."
+            for ITEM_ID in $ITEM_IDS; do
+              echo "Deleting personal item ID: $ITEM_ID"
+              if ! bw delete item "$ITEM_ID"; then
+                echo "::warning::Failed to delete personal item ID: $ITEM_ID. It might have been deleted already."
+              else
+                echo "Personal item ID: $ITEM_ID deleted."
+              fi
+            done
+            echo "All found personal items processed for deletion."
+          else
+            echo "No personal items (owned by default user) found in the vault."
+          fi
+
+          echo "Fetching all folder IDs (folders are personal)..."
+          FOLDER_IDS=$(bw list folders --raw | jq -r '.[].id')
+          if [ -n "$FOLDER_IDS" ]; then
+            echo "Found folders to delete. Deleting folders..."
+            for FOLDER_ID in $FOLDER_IDS; do
+              echo "Deleting folder ID: $FOLDER_ID"
+              if ! bw delete folder "$FOLDER_ID"; then
+                 echo "::warning::Failed to delete folder ID: $FOLDER_ID. It might have been deleted already."
+              else
+                echo "Folder ID: $FOLDER_ID deleted."
+              fi
+            done
+            echo "All found folders processed for deletion."
+          else
+            echo "No folders found in the vault."
+          fi
+
+          echo "Syncing Destination Warden after purge..."
+          bw sync --force
+          echo "Post-purge sync complete."
+          echo "--- Vault Purge Complete ---"
+        shell: bash
+
+      - name: Import Data from Backup
+        env:
+          BW_SESSION: ${{ env.BW_SESSION_ENV_VAR }}
+          LATEST_BACKUP_FILE_PATH: ${{ steps.find_backup.outputs.latest_file_path }}
+          # JSON_ENCRYPTION_PASSWORD is in the main job env
+        run: |
+          echo "--- Starting Data Import ---"
+          echo "BW_SESSION (first 5 chars): ${BW_SESSION:0:5}..."
+          echo "LATEST_BACKUP_FILE_PATH: $LATEST_BACKUP_FILE_PATH"
+          echo "JSON_ENCRYPTION_PASSWORD is set: $(if [ -n "$JSON_ENCRYPTION_PASSWORD" ]; then echo "true"; else echo "false"; fi)"
+
+          if [ -z "$BW_SESSION" ]; then
+            echo "::error::BW_SESSION is not set for import step."
+            exit 1
+          fi
+          if [ -z "$LATEST_BACKUP_FILE_PATH" ]; then
+            echo "::error::LATEST_BACKUP_FILE_PATH is not set."
+            exit 1
+          fi
+          if [ -z "$JSON_ENCRYPTION_PASSWORD" ]; then
+            echo "::error::JSON_ENCRYPTION_PASSWORD secret is not set for an encrypted import."
+            exit 1
+          fi
+
+          echo "Attempting to import data from '$LATEST_BACKUP_FILE_PATH'..."
+          # Import the encrypted Bitwarden JSON.
+          if echo "$JSON_ENCRYPTION_PASSWORD" | bw import bitwardenjson "$LATEST_BACKUP_FILE_PATH"; then
+            echo "Import command executed successfully. Check vault for results."
+          else
+            echo "::error::Warden import command failed."
+            exit 1
+          fi
+
+          echo "Syncing Destination Warden after import..."
+          bw sync --force
+          echo "Post-import sync complete."
+          echo "--- Data Import Complete ---"
+        shell: bash
+
+      - name: Destination Warden Logout
+        if: always()
+        env:
+          BW_SESSION: ${{ env.BW_SESSION_ENV_VAR }}
+        run: |
+          if [ -n "$BW_SESSION" ]; then
+            echo "Logging out from Destination Warden..."
+            bw logout
+            echo "Logout complete."
+          else
+            echo "No active Destination Warden session detected to logout from (BW_SESSION_ENV_VAR was not set, empty, or login failed)."
+          fi
+        shell: bash
