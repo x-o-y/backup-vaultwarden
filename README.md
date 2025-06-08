@@ -7,6 +7,10 @@
 > - The workflow is divided into 2 parts: `Export Vault to Repo` and `Purge Vault and Import from Repo`; you can choose as you need.
 > - The workflow is using **Bitwarden CLI**[^1] to export and import JSON files.
 
+> [!Warning]
+> - The destination vault will be purged before import!
+
+
 ## Export Encrypted JSON from vaultwarden/bitwarden to Github repo 📤
 
 - workflow name: `Export Vault to Repo`
