@@ -73,3 +73,22 @@ Your Repository Settings --> Secrets and Variables --> Actions --> New Repositor
 
 [^1]: Bitwarden CLI, https://bitwarden.com/help/cli/
 
+---
+
+Backup JSON to **GitHub** repository, automated via **GitHub Actions**.
+**GitHub account is all your need**.
+
+```mermaid
+flowchart LR
+    subgraph B[Backup new changes only]
+        direction TB
+        actions@{shape: hex, label: "GitHub Actions"}
+        repo[GitHub Repository]
+        backups@{ shape: docs, label: "JSON backups<br>Timestamped"}
+        actions -->repo --> backups
+    end
+
+    A[ Source <br> Bitwarden/Vaultwarden <br> Account] -- export encrypted JSON --> B
+    B -. purge & import to .-> C[Destination <br> Vaultwarden/Bitwarden <br> Account]
+
+```
