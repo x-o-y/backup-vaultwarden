@@ -95,3 +95,7 @@ flowchart LR
     B -. purge & import to .-> C[Destination <br> Vaultwarden/Bitwarden <br> Account]
 
 ```
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=x-o-y/backup-vaultwarden-publish&type=Date)](https://www.star-history.com/#x-o-y/backup-vaultwarden-publish&Date)
