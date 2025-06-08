@@ -10,6 +10,9 @@
 > [!Warning]
 > - The destination vault will be purged before import!
 
+## Use Cases
+1. In case if your bitwarden/vaultwarden account data cannot be accessed or deleted by mistake, you can restore with the encrypted backups in GitHub – keep the encrypt key in another safe place.
+2. Also, if you have two bitwarden/vaultden accounts, you can use this to sync from the source to the destination.
 
 ## Export Encrypted JSON from vaultwarden/bitwarden to Github repo 📤
 
