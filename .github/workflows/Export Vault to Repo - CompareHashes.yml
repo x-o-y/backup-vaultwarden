@@ -3,7 +3,8 @@ name: Export Vault to Repo, Compare Hashes
 on:
   workflow_dispatch: # Allows manual triggering from the Actions tab
   schedule:
-    - cron: '53 8 * * 0,1,2,3,4,5,6' # Change if necessary, 8:53 UTC is the morning in US
+    # - cron: '53 8 * * 0,1,2,3,4,5,6'
+    - cron: '53 21 * * 0,1,2,3,4,5,6'
 
 jobs:
   backup_vaultwarden_to_repo_compare_hash:

@@ -14,6 +14,25 @@
 1. In case if your bitwarden/vaultwarden account data cannot be accessed or deleted by mistake, you can restore with the encrypted backups in GitHub – keep the encrypt key in another safe place.
 2. Also, if you have two bitwarden/vaultden accounts, you can use this to sync from the source to the destination.
 
+Backup JSON to **GitHub** repository, automated via **GitHub Actions**.
+**A GitHub account is all your need**.
+
+```mermaid
+flowchart LR
+    subgraph B[Backup new changes only]
+        direction TB
+        actions@{shape: hex, label: "GitHub Actions"}
+        repo[GitHub Repository]
+        backups@{ shape: docs, label: "JSON backups<br>Timestamped"}
+        actions -->repo --> backups
+    end
+
+    A[ Source <br> Bitwarden/Vaultwarden <br> Account] -- export encrypted JSON --> B
+    B -. purge & import to .-> C[Destination <br> Vaultwarden/Bitwarden <br> Account]
+
+```
+
+
 ## Export Encrypted JSON from vaultwarden/bitwarden to Github repo 📤
 
 - workflow name: `Export Vault to Repo`
@@ -72,30 +91,10 @@ Your Repository Settings --> Secrets and Variables --> Actions --> New Repositor
 - 2025-06-04 v1.0
   - initial release
 
-## References 🔗
-
-[^1]: Bitwarden CLI, https://bitwarden.com/help/cli/
-
----
-
-Backup JSON to **GitHub** repository, automated via **GitHub Actions**.
-**GitHub account is all your need**.
-
-```mermaid
-flowchart LR
-    subgraph B[Backup new changes only]
-        direction TB
-        actions@{shape: hex, label: "GitHub Actions"}
-        repo[GitHub Repository]
-        backups@{ shape: docs, label: "JSON backups<br>Timestamped"}
-        actions -->repo --> backups
-    end
-
-    A[ Source <br> Bitwarden/Vaultwarden <br> Account] -- export encrypted JSON --> B
-    B -. purge & import to .-> C[Destination <br> Vaultwarden/Bitwarden <br> Account]
-
-```
-
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=x-o-y/backup-vaultwarden-publish&type=Date)](https://www.star-history.com/#x-o-y/backup-vaultwarden-publish&Date)
+
+## References 🔗
+
+[^1]: Bitwarden CLI, https://bitwarden.com/help/cli/

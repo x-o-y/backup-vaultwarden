@@ -37,6 +37,10 @@ jobs:
       JSON_ENCRYPTION_PASSWORD: ${{ secrets.JSON_ENCRYPTION_PASSWORD }}
 
     steps:
+      - name: Wait for Repository Sync
+        run: sleep 30s # Allow the repository to fully sync
+        shell: bash
+
       - name: Checkout repository
         uses: actions/checkout@v4
         # fetch-depth: 0 # Uncomment if you need full git history for other purposes
@@ -66,6 +70,10 @@ jobs:
             echo "::error::Backup directory '$BACKUP_DIR' does not exist in the repository."
             exit 1
           fi
+
+          echo "Listing latest 5 backup files (if available):"
+          ls -1t "$BACKUP_DIR"/backup_*.json 2>/dev/null | head -n 5
+
           # List .json files in the backup directory, sort by time (most recent first), and take the top one.
           LATEST_BACKUP_FILE=$(ls -1t "$BACKUP_DIR"/backup_*.json 2>/dev/null | head -n 1)
 
