@@ -86,6 +86,10 @@ Your Repository Settings --> Secrets and Variables --> Actions --> New Repositor
 
 ## Changelog 📝
 
+- 2025.06.10 v1.6.1
+  - automatic publish to public repo using .sh script
+- 2025.06.08 v1.6
+  - add sleep to make sure the repo has synced 
 - 2025.06.07 v1.5
   - add hash comparison to avoid duplicate backup
 - 2025-06-04 v1.0

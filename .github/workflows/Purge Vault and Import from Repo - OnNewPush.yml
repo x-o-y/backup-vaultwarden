@@ -38,7 +38,7 @@ jobs:
 
     steps:
       - name: Wait for Repository Sync
-        run: sleep 30s # Allow the repository to fully sync
+        run: sleep 20s # Allow the repository to fully sync
         shell: bash
 
       - name: Checkout repository
